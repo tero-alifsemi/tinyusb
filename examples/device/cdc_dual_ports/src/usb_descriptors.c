@@ -121,13 +121,13 @@ enum
   #define EPNUM_CDC_1_IN      0x86
 
 #else
-  #define EPNUM_CDC_0_NOTIF   0x81
-  #define EPNUM_CDC_0_OUT     0x02
-  #define EPNUM_CDC_0_IN      0x82
+  #define EPNUM_CDC_0_NOTIF   0x84
+  #define EPNUM_CDC_0_OUT     0x01
+  #define EPNUM_CDC_0_IN      0x81
 
-  #define EPNUM_CDC_1_NOTIF   0x83
-  #define EPNUM_CDC_1_OUT     0x04
-  #define EPNUM_CDC_1_IN      0x84
+  #define EPNUM_CDC_1_NOTIF   0x85
+  #define EPNUM_CDC_1_OUT     0x02
+  #define EPNUM_CDC_1_IN      0x82
 #endif
 
 uint8_t const desc_fs_configuration[] =
