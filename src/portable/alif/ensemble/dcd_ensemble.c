@@ -80,7 +80,8 @@ static uint16_t _xfer_bytes[2*TUP_DCD_ENDPOINT_MAX];
 static volatile uint32_t *_evnt_tail = NULL;
 static bool _ctrl_long_data = false;
 static volatile bool _xfer_cfgd = false;
-static uint32_t _sts_stage = 0;
+// bit 0: controller ready for STATUS IN, bit 1: TinyUSB requested it
+static uint8_t _sts_in = 0;
 static uint16_t _ep_dir_out_mps[4] = {MAX_PACKET_SIZE, 0, 0, 0};
 
 /// Private Functions ----------------------------------------------------------
@@ -88,6 +89,7 @@ static uint16_t _ep_dir_out_mps[4] = {MAX_PACKET_SIZE, 0, 0, 0};
 static void _dcd_handle_depevt(uint8_t rhport, uint8_t ep, uint8_t evt, uint8_t sts, uint16_t par);
 static void _dcd_handle_devt(uint8_t rhport, uint8_t evt, uint16_t info);
 static uint8_t _dcd_start_xfer(uint8_t ep, void* buf, uint32_t size, uint8_t type);
+static void _dcd_start_status_in(void);
 static uint8_t _dcd_cmd_wait(uint8_t ep, uint8_t typ, uint16_t param);
 static inline uint32_t _dcd_get_xferd_bytes(uint8_t ep);
 
@@ -537,15 +539,6 @@ void dcd_sof_enable(uint8_t rhport, bool en)
 
 /// Endpoint Management --------------------------------------------------------
 
-// Invoked when a control transfer's status stage is complete.
-// May help DCD to prepare for next control transfer, this API is optional.
-void dcd_edpt0_status_complete(uint8_t rhport, tusb_control_request_t const * request)
-{
-    (void) rhport, (void) request;
-    _ctrl_long_data = false;
-    _dcd_start_xfer(TUSB_DIR_OUT, _ctrl_buf, 8, TRBCTL_CTL_SETUP);
-}
-
 // Opening an endpoint is done for all non-control endpoints once the host picks
 // a configuration that the device should use.
 // At this point, the endpoint should be enabled in the peripheral and
@@ -691,13 +684,6 @@ bool dcd_edpt_xfer(uint8_t rhport, uint8_t ep_addr, uint8_t * buffer, uint16_t t
                 // DATA OUT request
                 _xfer_bytes[0] = total_bytes;
                 _dcd_start_xfer(0, buffer, total_bytes, TRBCTL_CTL_STAT3);
-            } else {
-                // TinyUSB explicitly requests STATUS OUT fetch after DATA IN
-                if (++_sts_stage == 2) {
-                    _sts_stage = 0;
-                    dcd_event_xfer_complete(rhport, tu_edpt_addr(0, TUSB_DIR_OUT),
-                                          0, XFER_RESULT_SUCCESS, true);
-                }
             }
         } break;
         case 1: { // CONTROL IN
@@ -715,13 +701,10 @@ bool dcd_edpt_xfer(uint8_t rhport, uint8_t ep_addr, uint8_t * buffer, uint16_t t
             } else {
                 // status events are handled directly from the ISR when USB
                 // controller triggers XferNotReady event for status stage
-                if (++_sts_stage == 2) {
-                    _sts_stage = 0;
-                    dcd_event_xfer_complete(rhport, tu_edpt_addr(0, TUSB_DIR_IN),
-                                            0, XFER_RESULT_SUCCESS, true);
-                }
-                //  dcd_event_xfer_complete(rhport, tu_edpt_addr(0, TUSB_DIR_IN),
-                //                          0, XFER_RESULT_SUCCESS, false);
+                dcd_int_disable(rhport);
+                _sts_in |= 2;
+                _dcd_start_status_in();
+                dcd_int_enable(rhport);
             }
         } break;
         default: { // DATA EPs (BULK & INTERRUPT only)
@@ -843,6 +826,8 @@ static void _dcd_handle_depevt(uint8_t rhport, uint8_t ep, uint8_t evt, uint8_t 
                     LOG("%02x %02x %02x %02x %02x %02x %02x %02x",
                         _ctrl_buf[0], _ctrl_buf[1], _ctrl_buf[2], _ctrl_buf[3],
                         _ctrl_buf[4], _ctrl_buf[5], _ctrl_buf[6], _ctrl_buf[7]);
+                    _sts_in = 0;
+                    _ctrl_long_data = false;
                     dcd_event_setup_received(rhport, _ctrl_buf, true);
                 } else if (trb->trbctl == TRBCTL_CTL_STAT3) {
                     if (_xfer_bytes[0] > 0) {
@@ -851,11 +836,13 @@ static void _dcd_handle_depevt(uint8_t rhport, uint8_t ep, uint8_t evt, uint8_t 
                                                 _dcd_get_xferd_bytes(0),
                                                 XFER_RESULT_SUCCESS, true);
                     } else {
-                        if (++_sts_stage == 2) {
-                            _sts_stage = 0;
-                            dcd_event_xfer_complete(rhport, tu_edpt_addr(0, TUSB_DIR_OUT),
-                                                    0, XFER_RESULT_SUCCESS, true);
-                        }
+                        // STATUS OUT done: report it, and get ready for the next SETUP here.
+                        // Waiting for TinyUSB's dcd_edpt0_status_complete() leaves EP0 deaf if
+                        // the host resets first: TinyUSB drops the status event queued behind
+                        // the bus reset.
+                        dcd_event_xfer_complete(rhport, tu_edpt_addr(0, TUSB_DIR_OUT),
+                                                0, XFER_RESULT_SUCCESS, true);
+                        _dcd_start_xfer(0, _ctrl_buf, 8, TRBCTL_CTL_SETUP);
                     }
                 } else {
                     // invalid TRBCTL value
@@ -864,16 +851,15 @@ static void _dcd_handle_depevt(uint8_t rhport, uint8_t ep, uint8_t evt, uint8_t 
             } else if (ep == 1) {
                 trb_t *trb = (trb_t *)_xfer_trb[1];
                 LOG("ep1 xfer trb3 = %08x trb2 = %08x", _xfer_trb[1][3], _xfer_trb[1][2]);
-                if (trb->trbctl != TRBCTL_CTL_STAT2) { // STATUS IN notification is done at xfer request
+                if (trb->trbctl != TRBCTL_CTL_STAT2) {
                     dcd_event_xfer_complete(rhport, tu_edpt_addr(0, TUSB_DIR_IN),
                                             _dcd_get_xferd_bytes(1),
                                             XFER_RESULT_SUCCESS, true);
                 } else {
-                    if (++_sts_stage == 2) {
-                        _sts_stage = 0;
-                        dcd_event_xfer_complete(rhport, tu_edpt_addr(0, TUSB_DIR_IN),
-                                                0, XFER_RESULT_SUCCESS, true);
-                    }
+                    // STATUS IN done: report it, and get ready for the next SETUP (see above)
+                    dcd_event_xfer_complete(rhport, tu_edpt_addr(0, TUSB_DIR_IN),
+                                            0, XFER_RESULT_SUCCESS, true);
+                    _dcd_start_xfer(0, _ctrl_buf, 8, TRBCTL_CTL_SETUP);
                 }
             } else {
                 // TODO: check if ep is open
@@ -896,10 +882,8 @@ static void _dcd_handle_depevt(uint8_t rhport, uint8_t ep, uint8_t evt, uint8_t 
             // XferNotReady NotActive for status stage
             if ((ep == 1) &&
                 depevt_sts.xfernotready.stage == DEPEVT_XFERNOTREADY_STS_CTRLSTS) {
-                if (0x00 == _ctrl_buf[0] && TUSB_REQ_SET_ADDRESS == _ctrl_buf[1]) {
-                    udev->dcfg_b.devaddr = _ctrl_buf[2];
-                }
-                _dcd_start_xfer(1, NULL, 0, TRBCTL_CTL_STAT2);
+                _sts_in |= 1;
+                _dcd_start_status_in();
                 break;
             }
 
@@ -949,7 +933,27 @@ static void _dcd_handle_devt(uint8_t rhport, uint8_t evt, uint16_t info) {
 
             // TODO: check this flag
             _xfer_cfgd = false;
-            _sts_stage = 0;
+
+            // EP0 is re-armed for SETUP when a status stage completes. If the reset landed in
+            // the middle of a control transfer that never happens, so drop what is left of
+            // the transfer and get ready for SETUP here.
+            _sts_in = 0;
+            _ctrl_long_data = false;
+            tusb_app_dcache_invalidate((uintptr_t) _xfer_trb[0], 2 * sizeof(trb_t));
+            trb_t *setup_trb = (trb_t *)_xfer_trb[0];
+            if (!setup_trb->hwo || setup_trb->trbctl != TRBCTL_CTL_SETUP) {
+                for (uint8_t ep = 0; ep < 2; ep++) {
+                    trb_t *trb = (trb_t *)_xfer_trb[ep];
+                    if (trb->hwo) { // HWO, still owned by the controller
+                        ugbl->guctl2_b.rst_actbitlater = 1;
+                        _dcd_cmd_wait(ep, CMDTYP_DEPENDXFER, ep);
+                        ugbl->guctl2_b.rst_actbitlater = 0;
+                    }
+                }
+                // Stalling EP0 returns the controller to the SETUP stage.
+                _dcd_cmd_wait(0, CMDTYP_DEPSSTALL, 0);
+                _dcd_start_xfer(0, _ctrl_buf, 8, TRBCTL_CTL_SETUP);
+            }
 
             // FIXME: Issue CMDTYP_DEPENDXFER for any active transfers (except for EP0)
 
@@ -1073,6 +1077,18 @@ static void _dcd_handle_devt(uint8_t rhport, uint8_t evt, uint16_t info) {
         default: {
             LOG("Unhandled DEVT event: %d", evt);
         }
+    }
+}
+
+// Start STATUS IN only once TinyUSB has handled the request, so it isn't ACKed early.
+static void _dcd_start_status_in(void)
+{
+    if (3 == _sts_in) {
+        _sts_in = 0;
+        if (0x00 == _ctrl_buf[0] && TUSB_REQ_SET_ADDRESS == _ctrl_buf[1]) {
+            udev->dcfg_b.devaddr = _ctrl_buf[2];
+        }
+        _dcd_start_xfer(1, NULL, 0, TRBCTL_CTL_STAT2);
     }
 }
 
